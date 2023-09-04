@@ -7,20 +7,25 @@ import type {
 import type { Prisma } from "@prisma/client";
 import type { WebhookTriggerEvents } from "@prisma/client";
 import { v4 as uuidv4 } from "uuid";
-import { expect } from "vitest";
+import { beforeEach } from "vitest";
 import "vitest-fetch-mock";
 
 import { appStoreMetadata } from "@calcom/app-store/appStoreMetaData";
-import { sendAwaitingPaymentEmail } from "@calcom/emails";
 import logger from "@calcom/lib/logger";
 import type { SchedulingType } from "@calcom/prisma/enums";
 import type { BookingStatus } from "@calcom/prisma/enums";
 import type { EventBusyDate } from "@calcom/types/Calendar";
-import type { Fixtures } from "@calcom/web/test/fixtures/fixtures";
 
-import appStoreMock from "../../../../tests/libs/__mocks__/app-store";
-import i18nMock from "../../../../tests/libs/__mocks__/libServerI18n";
-import prismaMock from "../../../../tests/libs/__mocks__/prisma";
+import appStoreMock from "../../../../../tests/libs/__mocks__/app-store";
+import i18nMock from "../../../../../tests/libs/__mocks__/libServerI18n";
+import prismaMock from "../../../../../tests/libs/__mocks__/prisma";
+import { getMockPaymentService } from "./MockPaymentService";
+
+let MOCK_DB = getInitialMockDb();
+
+beforeEach(() => {
+  MOCK_DB = getInitialMockDb();
+});
 
 type App = {
   slug: string;
@@ -111,6 +116,7 @@ const Timezones = {
   "+5:30": "Asia/Kolkata",
   "+6:00": "Asia/Dhaka",
 };
+logger.setSettings({ minLevel: "silly" });
 
 function addEventTypes(eventTypes: InputEventType[], usersStore: InputUser[]) {
   const baseEventType = {
@@ -152,6 +158,8 @@ function addEventTypes(eventTypes: InputEventType[], usersStore: InputUser[]) {
     };
   });
 
+  MOCK_DB.eventTypes = eventTypesWithUsers;
+
   logger.silly("TestData: Creating EventType", eventTypes);
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
   // @ts-ignore
@@ -160,6 +168,7 @@ function addEventTypes(eventTypes: InputEventType[], usersStore: InputUser[]) {
       const eventType = eventTypesWithUsers.find((e) => e.id === where.id) as unknown as PrismaEventType & {
         users: PrismaUser[];
       };
+      console.log("eventTypeMock", eventType, "where", where, "eventTypesWithUsers", eventTypesWithUsers);
       resolve(eventType);
     });
   };
@@ -173,6 +182,12 @@ function addEventTypes(eventTypes: InputEventType[], usersStore: InputUser[]) {
 
 async function addBookings(bookings: InputBooking[], eventTypes: InputEventType[]) {
   logger.silly("TestData: Creating Bookings", bookings);
+  const allBookings = (MOCK_DB.bookings = [...bookings].map((booking, index) => {
+    return {
+      ...booking,
+      id: index + 1,
+    };
+  }));
 
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
   // @ts-ignore
@@ -180,7 +195,7 @@ async function addBookings(bookings: InputBooking[], eventTypes: InputEventType[
     const where = findManyArg?.where || {};
     return new Promise((resolve) => {
       resolve(
-        bookings
+        allBookings
           // We can improve this filter to support the entire where clause but that isn't necessary yet. So, handle what we know we pass to `findMany` and is needed
           .filter((booking) => {
             /**
@@ -212,9 +227,52 @@ async function addBookings(bookings: InputBooking[], eventTypes: InputEventType[
       );
     });
   });
+
+  prismaMock.booking.create.mockImplementation(({ data }) => {
+    const attendees = data.attendees?.createMany?.data || [];
+    const booking = {
+      ...data,
+      id: allBookings.length + 1,
+      attendees,
+      userId: data.userId || data.user?.connect.id || null,
+      user: null,
+      eventTypeId: data.eventTypeId || data.eventType?.connect.id || null,
+      eventType: null,
+    };
+    allBookings.push(booking);
+    logger.silly("Created mock booking", booking);
+    return booking;
+  });
+
+  prismaMock.booking.findUnique.mockImplementation(({ where }) => {
+    const booking =
+      allBookings.find((booking) => {
+        return booking.id === where.id;
+      }) || null;
+    const bookingWithUserAndEventType = {
+      ...booking,
+      user: MOCK_DB.users.find((user) => user.id === booking?.userId) || null,
+      eventType: MOCK_DB.eventTypes.find((eventType) => eventType.id === booking?.eventTypeId) || null,
+    };
+    logger.silly("DB_STORE.users", MOCK_DB.users);
+    logger.silly("booking.findUnique.mock", { where, bookingWithUserAndEventType });
+    return bookingWithUserAndEventType;
+  });
+
+  prismaMock.booking.update.mockImplementation(({ where, data }) => {
+    const booking = allBookings.find((booking) => {
+      return booking.id === where.id;
+    });
+
+    const updatedBooking = Object.assign(booking, data);
+    logger.silly("booking.update.mock", { where, data, updatedBooking });
+    return updatedBooking;
+  });
 }
 
 async function addWebhooks(webhooks: InputWebhook[]) {
+  logger.silly("TestData: Creating Webhooks", webhooks);
+  // TODO: Improve it to actually consider where clause in prisma query.
   prismaMock.webhook.findMany.mockResolvedValue(
     webhooks.map((webhook) => {
       return {
@@ -232,6 +290,7 @@ async function addWebhooks(webhooks: InputWebhook[]) {
 }
 
 function addUsers(users: InputUser[]) {
+  MOCK_DB.users = users;
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
   // @ts-ignore
   prismaMock.user.findUniqueOrThrow.mockImplementation((findUniqueArgs) => {
@@ -249,7 +308,6 @@ function addUsers(users: InputUser[]) {
 
   prismaMock.credential.findMany.mockImplementation(({ where }) => {
     return new Promise((resolve) => {
-      console.log("findManyCred", allCredentials[where.userId]);
       resolve(allCredentials[where.userId] || []);
     });
   });
@@ -263,6 +321,12 @@ function addUsers(users: InputUser[]) {
       };
     }) as unknown as PrismaUser[]
   );
+
+  // prismaMock.user.findUnique.mockImplementation((findUniqueArgs) => {
+  //   const foundUser = users.find((user) => user.id === findUniqueArgs?.where?.id) as unknown as PrismaUser;
+  //   logger.silly("user.findUnique.mock", findUniqueArgs, foundUser);
+  //   return foundUser;
+  // });
 }
 
 export async function createBookingScenario(data: ScenarioData) {
@@ -308,11 +372,29 @@ export async function createBookingScenario(data: ScenarioData) {
   addBookings(data.bookings, data.eventTypes);
   // mockBusyCalendarTimes([]);
   addWebhooks(data.webhooks || []);
+  addPaymentMock();
   return {
     eventType,
   };
 }
 
+function addPaymentMock() {
+  const payments: any[] = (MOCK_DB.payments = []);
+  prismaMock.payment.create.mockImplementation(({ data }) => {
+    logger.silly("Creating a mock payment", data);
+    payments.push(data);
+  });
+  prismaMock.payment.findMany.mockImplementation(({ where }) => {
+    return payments.filter((payment) => {
+      return payment.externalId === where.externalId;
+    });
+  });
+  prismaMock.payment.findFirst.mockImplementation(({ where }) => {
+    return payments.find((payment) => {
+      return payment.externalId === where.externalId;
+    });
+  });
+}
 /**
  * This fn indents to /ally compute day, month, year for the purpose of testing.
  * We are not using DayJS because that's actually being tested by this code.
@@ -682,71 +764,22 @@ export function mockPaymentApp({
   appStoreLookupKey?: string;
 }) {
   appStoreLookupKey = appStoreLookupKey || metadataLookupKey;
-  function createPaymentLink({ paymentUid, name, email, date }) {
-    return "http://mock-payment.example.com/";
-  }
-
-  const paymentUid = uuidv4();
+  const { paymentUid, externalId, MockPaymentService } = getMockPaymentService();
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
   //@ts-ignore
   appStoreMock.default[appStoreLookupKey as keyof typeof appStoreMock.default].mockImplementation(() => {
     return new Promise((resolve) => {
       resolve({
         lib: {
-          // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-          //@ts-ignore
-          PaymentService: class mockPaymentService {
-            create({ amount, currency }, bookingId, bookerEmail, paymentOption, eventTitle) {
-              return {
-                id: uuidv4(),
-                uid: paymentUid,
-                // appId
-                bookingId: 1,
-                // booking       Booking?       @relation(fields: [bookingId], references: [id], onDelete: Cascade)
-                fee: 10,
-                success: true,
-                // refunded      Boolean
-                // data          Json
-                externalId: uuidv4(),
-                paymentOption,
-                amount,
-                currency,
-              };
-            }
-            async afterPayment(
-              event: CalendarEvent,
-              booking: {
-                user: { email: string | null; name: string | null; timeZone: string } | null;
-                id: number;
-                startTime: { toISOString: () => string };
-                uid: string;
-              },
-              paymentData: Payment
-            ): Promise<void> {
-              // TODO: App implementing PaymentService is supposed to send email by itself at the moment.
-              await sendAwaitingPaymentEmail({
-                ...event,
-                paymentInfo: {
-                  link: createPaymentLink({
-                    paymentUid: paymentData.uid,
-                    name: booking.user?.name,
-                    email: booking.user?.email,
-                    date: booking.startTime.toISOString(),
-                  }),
-                  paymentOption: paymentData.paymentOption || "ON_BOOKING",
-                  amount: paymentData.amount,
-                  currency: paymentData.currency,
-                },
-              });
-            }
-            constructor() {}
-          },
+          PaymentService: MockPaymentService,
         },
       });
     });
   });
+
   return {
     paymentUid,
+    externalId,
   };
 }
 
@@ -777,39 +810,6 @@ export function mockErrorOnVideoMeetingCreation({
   });
 }
 
-export function expectWebhookToHaveBeenCalledWith(
-  subscriberUrl: string,
-  data: {
-    triggerEvent: WebhookTriggerEvents;
-    payload: { metadata: Record<string, unknown>; responses: Record<string, unknown> };
-  }
-) {
-  const fetchCalls = fetchMock.mock.calls;
-  const webhookFetchCall = fetchCalls.find((call) => call[0] === subscriberUrl);
-  if (!webhookFetchCall) {
-    throw new Error(`Webhook not called with ${subscriberUrl}`);
-  }
-  expect(webhookFetchCall[0]).toBe(subscriberUrl);
-  const body = webhookFetchCall[1]?.body;
-  const parsedBody = JSON.parse((body as string) || "{}");
-  console.log({ payload: parsedBody.payload });
-  expect(parsedBody.triggerEvent).toBe(data.triggerEvent);
-  parsedBody.payload.metadata.videoCallUrl = parsedBody.payload.metadata.videoCallUrl
-    ? parsedBody.payload.metadata.videoCallUrl.replace(/\/video\/[a-zA-Z0-9]{22}/, "/video/DYNAMIC_UID")
-    : parsedBody.payload.metadata.videoCallUrl;
-  expect(parsedBody.payload.metadata).toContain(data.payload.metadata);
-  expect(parsedBody.payload.responses).toEqual(data.payload.responses);
-}
-
-export function expectWorkflowToBeTriggered() {
-  // TODO: Implement this.
-}
-
-export function expectBookingToBeInDatabase(booking: Partial<Prisma.BookingCreateInput>) {
-  const createBookingCalledWithArgs = prismaMock.booking.create.mock.calls[0];
-  expect(createBookingCalledWithArgs[0].data).toEqual(expect.objectContaining(booking));
-}
-
 export function getBooker({ name, email }: { name: string; email: string }) {
   return {
     name,
@@ -817,39 +817,17 @@ export function getBooker({ name, email }: { name: string; email: string }) {
   };
 }
 
-declare global {
-  // eslint-disable-next-line @typescript-eslint/no-namespace
-  namespace jest {
-    interface Matchers<R> {
-      toHaveEmail(expectedEmail: { htmlToContain?: string; to: string }): R;
-    }
-  }
+function getInitialMockDb() {
+  return {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    users: [] as any[],
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    eventTypes: [] as any[],
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    bookings: [] as any[],
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    payments: [] as any[],
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    webhooks: [] as any[],
+  };
 }
-
-expect.extend({
-  toHaveEmail(
-    testEmail: ReturnType<Fixtures["emails"]["get"]>[number],
-    expectedEmail: {
-      //TODO: Support email HTML parsing to target specific elements
-      htmlToContain?: string;
-      to: string;
-    }
-  ) {
-    let isHtmlContained = true;
-    let isToAddressExpected = true;
-    if (expectedEmail.htmlToContain) {
-      isHtmlContained = testEmail.html.includes(expectedEmail.htmlToContain);
-    }
-    isToAddressExpected = expectedEmail.to === testEmail.to;
-
-    return {
-      pass: isHtmlContained && isToAddressExpected,
-      message: () => {
-        if (!isHtmlContained) {
-          return `Email HTML is not as expected. Expected:"${expectedEmail.htmlToContain}" isn't contained in "${testEmail.html}"`;
-        }
-        return `Email To address is not as expected. Expected:${expectedEmail.to} isn't equal to ${testEmail.to}`;
-      },
-    };
-  },
-});

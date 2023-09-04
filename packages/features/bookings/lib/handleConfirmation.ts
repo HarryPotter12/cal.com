@@ -41,6 +41,7 @@ export async function handleConfirmation(args: {
     userId: number | null;
   };
   paid?: boolean;
+  requiresConfirmation: boolean;
 }) {
   const { user, evt, recurringEventId, prisma, bookingId, booking, paid } = args;
   const eventManager = new EventManager(user);

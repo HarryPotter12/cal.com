@@ -16,6 +16,7 @@ import { getErrorFromUnknown } from "@calcom/lib/errors";
 import { HttpError as HttpCode } from "@calcom/lib/http-error";
 import logger from "@calcom/lib/logger";
 import { getTranslation } from "@calcom/lib/server/i18n";
+import { getTimeFormatStringFromUserTimeFormat } from "@calcom/lib/timeFormat";
 import { prisma, bookingMinimalSelect } from "@calcom/prisma";
 import { BookingStatus } from "@calcom/prisma/enums";
 import { EventTypeMetaDataSchema } from "@calcom/prisma/zod-utils";
@@ -131,8 +132,7 @@ async function getBooking(bookingId: number) {
   };
 }
 
-async function handlePaymentSuccess(event: Stripe.Event) {
-  log.debug("Payment successful:", JSON.stringify(event));
+export async function handlePaymentSuccess(event: Stripe.Event) {
   const paymentIntent = event.data.object as Stripe.PaymentIntent;
   const payment = await prisma.payment.findFirst({
     where: {
@@ -271,6 +271,7 @@ async function handlePaymentSuccess(event: Stripe.Event) {
   await prisma.$transaction([paymentUpdate, bookingUpdate]);
 
   if (!isConfirmed) {
+    //TODO: Test an event that requires confirmation conditionally
     if (!eventTypeRaw?.requiresConfirmation) {
       await handleConfirmation({
         user: userWithCredentials,
@@ -415,7 +416,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     const event = stripe.webhooks.constructEvent(payload, sig, process.env.STRIPE_WEBHOOK_SECRET);
 
-    if (!event.account) {
+    // bypassing this validation for e2e tests
+    // in order to successfully confirm the payment
+    if (!event.account && !process.env.NEXT_PUBLIC_IS_E2E) {
       throw new HttpCode({ statusCode: 202, message: "Incoming connected account" });
     }
 
